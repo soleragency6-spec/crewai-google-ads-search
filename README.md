@@ -2,6 +2,29 @@
 
 `main.py` contient toute la logique : API FastAPI, deux agents utilisant l'API OpenAI avec `gpt-4o`, contrats Pydantic, validation métier et sérialisation JSON. Aucun YAML ni accès direct à Google Ads n'est nécessaire. Les agents ne disposent d'aucun outil de modification du compte.
 
+## Google Ads Script hebdomadaire — API 1.1
+
+Le fichier [`google_ads_script.js`](google_ads_script.js) est le Script complet à coller dans un compte Google Ads individuel. Le token est volontairement remplacé par un emplacement dans cette version publique : renseigner `CONFIG.WEBHOOK_TOKEN` dans la copie privée de l'éditeur Google Ads uniquement.
+
+1. Dans Google Ads, ouvrir **Outils → Actions groupées → Scripts**, créer un Script et coller le contenu du fichier.
+2. Vérifier `CONFIG.DEFAULT_TARGET_CPA` ou `TARGET_CPA_BY_CAMPAIGN_ID`, exprimés dans la devise du compte. Sans valeur métier explicite, le Script utilise le tCPA de la campagne ; si aucun CPA n'est disponible, il ignore la campagne et l'indique dans les journaux.
+3. Confirmer que les conversions primaires correspondent à l'objectif métier (`CONVERSION_TRACKING_CONFIRMED`). Le Script ne peut pas diagnostiquer à lui seul la fiabilité du suivi.
+4. Autoriser les accès demandés. Lancer **Aperçu** : l'appel au serveur OpenAI est réel et peut être facturé, mais les ordres ne modifient ni Google Ads ni le journal Drive.
+5. Pour appliquer, définir `DRY_RUN=false` dans Render et conserver `CONFIG.DRY_RUN=false` dans le Script. Le drapeau serveur et le mode Aperçu restent prioritaires.
+6. Planifier **une seule instance du Script par compte**, une fois par semaine. Ne pas lancer simultanément plusieurs copies : le journal Drive ne constitue pas un verrou transactionnel.
+
+La période est la dernière semaine complète lundi–dimanche dont tous les jours respectent `CONVERSION_LAG_DAYS` (7 par défaut). Exemple : une exécution le 20 octobre 2026 analyse le 5–11 octobre, afin de laisser mûrir les conversions. Les dates sont journalisées dans le fuseau horaire du compte. Ce choix évite de confondre conversions retardées et gaspillage.
+
+Les performances viennent de `campaign`, `keyword_view` et `search_term_view` via [AdsApp.search et GAQL](https://developers.google.com/google-ads/scripts/docs/concepts/reports). Les limites sont de 50 campagnes et 500 mots-clés dépensiers par lot ; au-delà, le Script s'arrête avant toute modification et demande de réduire `CAMPAIGN_IDS`. Les 300 termes de recherche visibles les plus dépensiers sont envoyés. Certains termes restent masqués par Google : l'analyse de termes n'est pas exhaustive.
+
+Le serveur choisit les négatifs uniquement parmi les termes observés à zéro conversion, au moins 30 clics et au moins deux CPA cibles dépensés. Il renvoie `ADD_AD_GROUP_NEGATIVE_KEYWORD`, avec le texte exact et `match_type=EXACT`. Le Script appelle [`adGroup.createNegativeKeyword('[texte]')`](https://developers.google.com/google-ads/scripts/docs/reference/adsapp/adsapp_adgroup) après avoir vérifié le groupe, les métriques source, les doublons et l'absence de conflit textuel avec un mot-clé positif actif. Il applique au maximum 20 nouveaux négatifs par exécution. Aucun négatif large, expression ou au niveau campagne n'est généré.
+
+Le Script boucle également sur `SET_CAMPAIGN_DAILY_BUDGET`. Les budgets partagés sont exclus ; les variations restent limitées à ±20 %. Par défaut, le plafond du lot est la somme des budgets actuels : les hausses doivent donc être financées par des baisses, appliquées en premier. `MAX_TOTAL_DAILY_BUDGET` peut fixer un autre plafond dans la devise du compte. Une hausse nécessite aussi `BUDGET_STABILITY_CONFIRMED=true`, à renseigner seulement après vérification de la stabilité des budgets sur la période. Une valeur `false` autorise l'analyse, les négatifs et les baisses, mais bloque les hausses.
+
+Un fichier JSON `CrewAI_Search_State_<compte>.json` est conservé dans votre Drive via [DriveApp](https://developers.google.com/google-ads/scripts/docs/examples/driveapp). Il contient les périodes terminées, identifiants de requêtes/ordres et dates de modification des budgets, sans token. Un budget est réservé dans le journal avant mutation : après un échec ambigu, vérifier manuellement l'état avant de supprimer une réservation. La même période terminée n'est pas réappliquée.
+
+Le Script vérifie `/capabilities` avant l'extraction. Il s'arrête avec une erreur explicite si la version 1.1 n'est pas déployée ; il ne tente pas d'envoyer des données sur sept jours à l'ancienne version.
+
 ## Déployer sur Render depuis GitHub
 
 1. Dans [Render](https://dashboard.render.com/), choisir **New → Web Service**.
@@ -92,7 +115,7 @@ Fournir les totaux complets des campagnes, même si le lot de mots-clés est par
 
 `target_cpa_micros` est le CPA cible **métier** de la campagne, y compris si elle utilise des enchères manuelles. `search_budget_lost_impression_share` est une fraction entre 0 et 1, ou `null` si indisponible ; ne pas remplacer une valeur absente par zéro.
 
-Le délai de conversion est choisi selon votre cycle réel. Le serveur exige au moins 14 jours et exclut les derniers jours indiqués par `conversion_lag_days`. Le snapshot doit dater de moins de 24 heures. Les champs `conversion_tracking_ok` et `budget_unchanged_during_period` sont des préconditions à vérifier avant envoi, pas des valeurs à renseigner aveuglément. Le budget historique stable permet de calculer le taux d'utilisation budgétaire.
+Le délai de conversion est choisi selon votre cycle réel. Le serveur exige au moins 7 jours et exclut les derniers jours indiqués par `conversion_lag_days`. Le snapshot doit dater de moins de 24 heures. `conversion_tracking_ok=true` est une précondition à vérifier avant envoi. `budget_unchanged_during_period` est une déclaration métier vérifiée : s'il est faux, aucune hausse n'est permise. Le budget historique stable permet de calculer le taux d'utilisation budgétaire.
 
 Cette version traite les campagnes Search activées avec un budget quotidien individuel. Les campagnes avec budget partagé ou total sont rejetées. `max_total_daily_budget_micros` est le plafond de la **somme des budgets quotidiens du lot envoyé** ; il ne représente pas un plafond de facturation Google Ads, ni celui du compte entier si des campagnes sont absentes.
 
@@ -103,10 +126,10 @@ L'analyste identifie tous les mots-clés qui cumulent zéro conversion, au moins
 Le strategist décide librement de conserver le budget ou propose une variation entière comprise entre -20 % et +20 %, dans ces limites déterministes :
 
 - Baisse : les mots-clés signalés représentent au moins 30 % du coût campagne, et la campagne n'a aucune conversion ou son CPA dépasse la cible.
-- Hausse : au moins 5 conversions, CPA inférieur ou égal à la cible, au moins 10 % d'impressions perdues pour cause de budget et utilisation d'au moins 80 % du budget quotidien multiplié par le nombre de jours.
+- Hausse : budget stable sur la période, au moins 5 conversions, CPA inférieur ou égal à la cible, au moins 10 % d'impressions perdues pour cause de budget et utilisation d'au moins 80 % du budget quotidien multiplié par le nombre de jours.
 - Le total de tous les budgets du lot, campagnes inchangées incluses, doit respecter le plafond transmis.
 
-Ces seuils sont des choix de départ configurés dans le code ; ils ne constituent pas un test statistique de rentabilité. Un mot-clé signalé peut rester actif. Cette version ajuste uniquement les budgets campagne.
+Ces seuils sont des choix de départ configurés dans le code ; ils ne constituent pas un test statistique de rentabilité. Un mot-clé signalé peut rester actif. Les nouvelles exclusions concernent les termes observés et sont appliquées au groupe source, uniquement en correspondance exacte.
 
 Extrait d'un ordre possible pour le cas ci-dessus, si le strategist choisit -20 % :
 
@@ -121,7 +144,7 @@ Extrait d'un ordre possible pour le cas ci-dessus, si le strategist choisit -20 
 }
 ```
 
-La réponse complète inclut aussi `schema_version`, `request_id`, `customer_id`, `currency`, `dry_run`, `generated_at`, `expires_at`, `analysis`, `summary`, `orders`, et un `order_id` pour chaque ordre. `orders: []` est un résultat normal lorsqu'aucun changement n'est justifié. Les montants finaux sont calculés par Python et arrondis à 0,01 unité de devise.
+La réponse complète inclut aussi `schema_version` (1.1), `request_id`, `customer_id`, `currency`, `dry_run`, `generated_at`, `expires_at`, `analysis`, `summary`, `orders`, et un `order_id` pour chaque ordre. `orders` peut contenir des budgets et des négatifs ; `orders: []` est un résultat normal lorsqu'aucun changement n'est justifié. `search_terms` est un champ d'entrée facultatif ; sans lui, aucun négatif ne peut être produit. Les montants finaux sont calculés par Python et arrondis à 0,01 unité de devise.
 
 ## Appel depuis Google Ads Scripts
 
@@ -152,7 +175,7 @@ Le traitement HTTP est synchrone. Configurer le délai de l'hébergeur pour couv
 
 ## Références vérifiées
 
-Validation locale : 15 tests passent sur les schémas, seuils, calculs, plafond, authentification HTTP et erreurs, avec le runtime CrewAI remplacé pour les tests. Les paramètres utilisés ont aussi été contrôlés dans le code source de CrewAI 1.15.28. L'installation complète des dépendances a échoué faute d'espace disque : l'orchestration CrewAI réelle et les appels OpenAI n'ont pas été exécutés. Il faut donc effectuer un essai en simulation sur l'hébergement avant d'activer l'application des ordres.
+Validation locale de la version 1.1 : 27 tests Python (dont l'orchestration CrewAI réelle avec des LLM simulés, les reprises de validation, l'API HTTP et le contrat du payload JavaScript) et 11 tests JavaScript avec doubles Google Ads/Drive passent. Ils couvrent les deux types d'ordres, les négatifs inventés ou conflictuels, les périodes, les budgets, l'authentification, l'expiration, la simulation et la non-répétition. Une incompatibilité d'annotations de retour dans les guardrails de la version initiale a été corrigée et vérifiée avec CrewAI 1.15.28. Les appels OpenAI réels, l'exécution dans Google Ads et la construction locale Docker n'ont pas été testés ; commencer par Aperçu avant application.
 
 - [CrewAI : sorties structurées des tâches](https://docs.crewai.com/en/concepts/tasks)
 - [CrewAI : intégration native des LLM](https://docs.crewai.com/en/concepts/llms)
