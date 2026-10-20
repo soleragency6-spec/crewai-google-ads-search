@@ -127,6 +127,7 @@ function main() {
       }
       // Réservation AVANT mutation : un échec ambigu nécessite une vérification manuelle.
       state.budgetChanges[order.campaign_id] = today;
+      state.budgetPeriods[order.campaign_id] = periodKey;
       saveState_(store, state);
       budget.setAmount(next / 1e6);
       const applied = moneyToMicros_(budget.getAmount());
@@ -361,6 +362,10 @@ function preparePlan_(orders, input, state, timeZone) {
         totals[order.campaign_id] = moneyToMicros_(campaign.getBudget().getAmount());
         return;
       }
+      if (state.budgetPeriods[order.campaign_id] === input.period_start + ':' + input.period_end) {
+        totals[order.campaign_id] = moneyToMicros_(campaign.getBudget().getAmount());
+        return;
+      }
       checkedBudget_(campaign, order);
       totals[order.campaign_id] = next;
     } else if (order.action === 'ADD_AD_GROUP_NEGATIVE_KEYWORD') {
@@ -486,6 +491,7 @@ function readState_(customerId) {
   if (state.customerId !== customerId || !state.completedPeriods || !state.requestIds
       || !state.appliedOrders || !state.budgetChanges) throw new Error('Journal Drive invalide.');
   state.alertReceipts = state.alertReceipts || {};
+  state.budgetPeriods = state.budgetPeriods || {};
   return {file: file, name: name, state: state};
 }
 
