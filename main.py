@@ -10,10 +10,12 @@ Les montants sont des entiers en micros de la devise du compte (1 = 1_000_000).
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import logging
 import os
+import re
 import secrets
 import sqlite3
 import time
@@ -94,6 +96,16 @@ class SearchTerm(Model):
         return f"{self.campaign_id}/{self.ad_group_id}/{self.text}"
 
 
+class GoogleRecommendation(Model):
+    resource_name: str = Field(pattern=r"^customers/[0-9]{10}/recommendations/[0-9]+$", max_length=100)
+    campaign_id: ID
+    type: str = Field(pattern=r"^[A-Z_]+$", max_length=80)
+    base_cost_micros: Micros | None = None
+    potential_cost_micros: Micros | None = None
+    base_conversions: Conversions | None = None
+    potential_conversions: Conversions | None = None
+
+
 class AdsInput(Model):
     request_id: UUID
     customer_id: str = Field(pattern=r"^[0-9]{10}$")
@@ -114,6 +126,7 @@ class AdsInput(Model):
     campaigns: list[Campaign] = Field(min_length=1, max_length=50)
     keywords: list[Keyword] = Field(max_length=500)
     search_terms: list[SearchTerm] = Field(default_factory=list, max_length=300)
+    recommendations: list[GoogleRecommendation] = Field(default_factory=list, max_length=50)
 
     @model_validator(mode="after")
     def validate_snapshot(self) -> AdsInput:
@@ -151,6 +164,11 @@ class AdsInput(Model):
             raise ValueError("Les coûts mots-clés dépassent les totaux campagne")
         if len({t.key for t in self.search_terms}) != len(self.search_terms):
             raise ValueError("Terme de recherche dupliqué")
+        if (len({r.resource_name for r in self.recommendations}) != len(self.recommendations)
+                or any(r.campaign_id not in campaigns
+                       or not r.resource_name.startswith(f"customers/{self.customer_id}/")
+                       for r in self.recommendations)):
+            raise ValueError("Recommandation dupliquée ou hors compte/campagne")
         term_totals = dict.fromkeys(campaigns, 0)
         for term in self.search_terms:
             if term.campaign_id not in campaigns:
@@ -213,6 +231,15 @@ class NegativeOrder(Model):
     reason: str
 
 
+class RecommendationOrder(Model):
+    order_id: str
+    action: Literal["APPLY_GOOGLE_RECOMMENDATION"] = "APPLY_GOOGLE_RECOMMENDATION"
+    campaign_id: ID
+    resource_name: str
+    recommendation_type: Literal["SITELINK_ASSET", "OPTIMIZE_AD_ROTATION"]
+    reason: str
+
+
 class Alert(Model):
     code: str
     campaign_id: ID | None = None
@@ -247,12 +274,36 @@ class AdsResponse(Model):
     analysis: Analysis | None = None
     summary: str
     orders: list[Order | NegativeOrder]
+    recommendation_orders: list[RecommendationOrder] = Field(default_factory=list)
     status: Literal["nominal", "exception"] = "nominal"
     silent: bool = True
     requires_attention: bool = False
     alerts: list[Alert] = Field(default_factory=list)
     notification_status: DeliveryStatus = "not_needed"
     notification_receipts: dict[str, float] = Field(default_factory=dict)
+
+
+RealResource = Literal["BRAND_BRIEF", "OFFICIAL_LOGO", "REAL_PERSON_PHOTO", "EXACT_BRAND_GUIDELINES"]
+
+
+class AssetRequest(Model):
+    request_id: UUID
+    customer_id: str = Field(pattern=r"^[0-9]{10}$")
+    campaign_id: ID
+    campaign_type: Literal["PERFORMANCE_MAX", "DISPLAY"]
+    brand_name: str = Field(min_length=2, max_length=100)
+    product_or_service: str = Field(min_length=5, max_length=500)
+    audience: str = Field(min_length=3, max_length=300)
+    required_resources: list[RealResource] = Field(default_factory=list, max_length=3)
+
+
+class AssetResponse(Model):
+    status: Literal["generated", "blocked"]
+    reason: str = ""
+    image_model: str | None = None
+    image_png_base64: str | None = None
+    whatsapp_status: DeliveryStatus = "not_needed"
+    email_status: DeliveryStatus = "not_needed"
 
 
 class DeliveryResult(Model):
@@ -396,7 +447,40 @@ def detect_exceptions(data: AdsInput) -> list[Alert]:
             add("BUDGET_PACING", f"{spent:.0f} % du budget quotidien consommé à {local:%H:%M}, "
                 f"après {100 * elapsed:.0f} % de la journée.",
                 "Vérifier la distribution horaire et la dépense réelle ; le budget Google Ads est une moyenne.", "critical")
+    for recommendation in data.recommendations:
+        if recommendation.type == "IMPROVE_GOOGLE_TAG_COVERAGE":
+            alerts.append(Alert(code="GOOGLE_TAG_COVERAGE", campaign_id=recommendation.campaign_id,
+                message="Google recommande de corriger la couverture du tag de conversion.",
+                suggested_action="Auditer et corriger le tag ; cette intervention nécessite une vérification technique."))
     return alerts
+
+
+AUTO_RECOMMENDATION_TYPES = frozenset({"SITELINK_ASSET", "OPTIMIZE_AD_ROTATION"})
+
+
+def safe_recommendation_orders(data: AdsInput, alerts: list[Alert]) -> list[RecommendationOrder]:
+    """Appliquer uniquement des estimations favorables sans hausse du coût hebdomadaire."""
+    blocked = {alert.campaign_id for alert in alerts}
+    orders = []
+    for recommendation in data.recommendations:
+        if recommendation.campaign_id in blocked or None in blocked:
+            continue
+        if recommendation.type not in AUTO_RECOMMENDATION_TYPES:
+            continue  # Les recommandations de budget, enchères et diffusion restent ignorées.
+        base_cost = recommendation.base_cost_micros
+        next_cost = recommendation.potential_cost_micros
+        base_conversions = recommendation.base_conversions
+        next_conversions = recommendation.potential_conversions
+        if (base_cost is None or base_cost <= 0 or next_cost is None or next_cost > base_cost
+                or base_conversions is None or base_conversions < 5
+                or next_conversions is None or next_conversions < base_conversions * 1.05):
+            continue
+        order_id = hashlib.sha256(
+            f"{data.customer_id}:{recommendation.resource_name}:apply".encode()).hexdigest()
+        orders.append(RecommendationOrder(order_id=order_id, campaign_id=recommendation.campaign_id,
+            resource_name=recommendation.resource_name, recommendation_type=recommendation.type,
+            reason="Estimation Google : conversions +5 % minimum, sans hausse du coût hebdomadaire estimé."))
+    return orders
 
 
 def notification_configuration() -> dict[str, Any]:
@@ -441,6 +525,132 @@ def send_alert_email(subject: str, text: str) -> None:
         result = json.load(response)
         if not result.get("id"):
             raise RuntimeError("L'API email n'a pas confirmé l'acceptation du message")
+
+
+def whatsapp_configuration() -> dict[str, Any]:
+    required = ("WHATSAPP_ACCESS_TOKEN", "WHATSAPP_PHONE_NUMBER_ID", "WHATSAPP_ALERT_TO",
+                "WHATSAPP_TEMPLATE_NAME", "WHATSAPP_GRAPH_VERSION")
+    missing = [name for name in required if not os.environ.get(name, "").strip()]
+    if not missing:
+        if not re.fullmatch(r"[0-9]+", os.environ["WHATSAPP_PHONE_NUMBER_ID"]):
+            missing.append("WHATSAPP_PHONE_NUMBER_ID invalide")
+        if not re.fullmatch(r"[0-9]{8,15}", os.environ["WHATSAPP_ALERT_TO"]):
+            missing.append("WHATSAPP_ALERT_TO invalide")
+        if not re.fullmatch(r"v[0-9]+\.[0-9]+", os.environ["WHATSAPP_GRAPH_VERSION"]):
+            missing.append("WHATSAPP_GRAPH_VERSION invalide")
+        if not re.fullmatch(r"[a-z0-9_]+", os.environ["WHATSAPP_TEMPLATE_NAME"]):
+            missing.append("WHATSAPP_TEMPLATE_NAME invalide")
+    return {"provider": "meta_whatsapp_cloud_api", "configured": not missing, "missing": missing}
+
+
+def send_resource_whatsapp(message: str) -> None:
+    if not whatsapp_configuration()["configured"]:
+        raise RuntimeError("Canal WhatsApp non configuré")
+    url = ("https://graph.facebook.com/" + os.environ["WHATSAPP_GRAPH_VERSION"] + "/"
+           + os.environ["WHATSAPP_PHONE_NUMBER_ID"] + "/messages")
+    body = {"messaging_product": "whatsapp", "to": os.environ["WHATSAPP_ALERT_TO"],
+            "type": "template", "template": {"name": os.environ["WHATSAPP_TEMPLATE_NAME"],
+            "language": {"code": os.environ.get("WHATSAPP_TEMPLATE_LANGUAGE", "fr")},
+            "components": [{"type": "body", "parameters": [{"type": "text", "text": message[:900]}]}]}}
+    request = Request(url, data=json.dumps(body).encode(), method="POST", headers={
+        "Authorization": "Bearer " + os.environ["WHATSAPP_ACCESS_TOKEN"],
+        "Content-Type": "application/json", "User-Agent": "GoogleAdsExceptions/1.0"})
+    with urlopen(request, timeout=10) as response:
+        if not json.load(response).get("messages", [{}])[0].get("id"):
+            raise RuntimeError("WhatsApp n'a pas confirmé l'acceptation du message")
+
+
+RESOURCE_PHRASES = {
+    "OFFICIAL_LOGO": re.compile(r"logo (?:officiel|authentique|official|original)", re.I),
+    "REAL_PERSON_PHOTO": re.compile(r"(?:photo d.identité|vrai portrait|real person|real photo|photo réelle)", re.I),
+    "EXACT_BRAND_GUIDELINES": re.compile(r"(?:charte graphique (?:exacte|précise)|exact brand guideline)", re.I),
+}
+
+
+def missing_real_resources(data: AssetRequest) -> list[str]:
+    text = f"{data.brand_name} {data.product_or_service} {data.audience}"
+    return sorted(set(data.required_resources) |
+                  {name for name, pattern in RESOURCE_PHRASES.items() if pattern.search(text)})
+
+
+def notify_resource_request(data: AssetRequest, missing: list[str]) -> tuple[DeliveryStatus, DeliveryStatus]:
+    """L'envoi WhatsApp requiert un modèle Meta approuvé ; l'email sert de relais."""
+    fingerprint = hashlib.sha256(
+        f"{data.customer_id}:{data.campaign_id}:{','.join(missing)}".encode()).hexdigest()
+    now = time.time()
+    with alert_db() as db:
+        db.execute("BEGIN IMMEDIATE")
+        row = db.execute("SELECT last_sent,inflight_until FROM alerts WHERE fingerprint=?", (fingerprint,)).fetchone()
+        if row and (row["last_sent"] >= now - 86400 or row["inflight_until"] >= now):
+            return "suppressed", "suppressed"
+        db.execute("""INSERT INTO alerts (fingerprint,customer_id,payload,last_seen,inflight_until)
+            VALUES (?,?,?,?,?) ON CONFLICT(fingerprint) DO UPDATE SET
+            payload=excluded.payload,last_seen=excluded.last_seen,inflight_until=excluded.inflight_until""",
+            (fingerprint, data.customer_id, json.dumps({"missing": missing}), now, now + 90))
+    text = (f"Ressource requise pour Google Ads {data.customer_id}, campagne {data.campaign_id} "
+            f"({data.campaign_type}) : {', '.join(missing)}. Fournir un original vérifié ; "
+            "la génération et la publication de l'asset sont bloquées.")
+    whatsapp_status: DeliveryStatus = "unconfigured"
+    email_status: DeliveryStatus = "not_needed"
+    try:
+        if whatsapp_configuration()["configured"]:
+            send_resource_whatsapp(text)
+            whatsapp_status = "sent"
+        else:
+            send_alert_email("[Google Ads] Ressource visuelle requise", text)
+            email_status = "sent"
+    except Exception as exc:
+        log.error("Ressource visuelle : envoi principal échoué type=%s", type(exc).__name__)
+        if whatsapp_configuration()["configured"]:
+            whatsapp_status = "failed"
+            try:
+                send_alert_email("[Google Ads] Ressource visuelle requise", text)
+                email_status = "sent"
+            except Exception as fallback_exc:
+                log.error("Ressource visuelle : email échoué type=%s", type(fallback_exc).__name__)
+                email_status = "failed"
+        else:
+            email_status = "failed"
+    accepted = whatsapp_status == "sent" or email_status == "sent"
+    with alert_db() as db:
+        db.execute("UPDATE alerts SET last_sent=?,inflight_until=0,last_error=? WHERE fingerprint=?",
+                   (time.time() if accepted else 0,
+                    None if accepted else "NotificationFailed", fingerprint))
+    return whatsapp_status, email_status
+
+
+def generate_ad_image(data: AssetRequest) -> tuple[str, str]:
+    from PIL import Image, ImageOps
+    from io import BytesIO
+
+    model = os.environ.get("IMAGE_MODEL", "gpt-image-2.5-flare")
+    if model not in {"gpt-image-2.5-flare", "gpt-image-2", "gpt-image-2.5-sunburst"}:
+        raise RuntimeError("IMAGE_MODEL non pris en charge")
+    prompt = ("Créer un visuel publicitaire original, propre, sans texte, sans logo et sans personne "
+              "identifiable. Ne pas inventer de marque, d'identité, de garantie ni de charte graphique. "
+              f"Marque indiquée : {data.brand_name}. Produit ou service : {data.product_or_service}. "
+              f"Public : {data.audience}. Format horizontal 1,91:1 adapté à {data.campaign_type}.")
+    body = json.dumps({"model": model, "prompt": prompt, "n": 1, "size": "1536x800",
+                       "quality": "medium", "output_format": "png",
+                       "safety_identifier": hashlib.sha256(data.customer_id.encode()).hexdigest()}).encode()
+    request = Request("https://api.openai.com/v1/images/generations", data=body, method="POST", headers={
+        "Authorization": "Bearer " + os.environ["OPENAI_API_KEY"],
+        "Content-Type": "application/json", "User-Agent": "GoogleAdsExceptions/1.0"})
+    with urlopen(request, timeout=90) as response:
+        encoded = json.load(response)["data"][0]["b64_json"]
+    image = base64.b64decode(encoded, validate=True)
+    if not image.startswith(b"\x89PNG\r\n\x1a\n") or len(image) > 10_000_000:
+        raise RuntimeError("Image OpenAI invalide ou trop volumineuse")
+    with Image.open(BytesIO(image)) as original:
+        if original.format != "PNG" or original.size != (1536, 800):
+            raise RuntimeError("Dimensions de l'image OpenAI inattendues")
+        landscape = ImageOps.fit(original.convert("RGB"), (1200, 628), method=Image.Resampling.LANCZOS)
+    output = BytesIO()
+    landscape.save(output, format="PNG", optimize=True)
+    asset = output.getvalue()
+    if len(asset) > 5_120_000:
+        raise RuntimeError("Image Google Ads trop volumineuse")
+    return model, base64.b64encode(asset).decode("ascii")
 
 
 def notify_exceptions(data: AdsInput, alerts: list[Alert]) -> DeliveryResult:
@@ -511,7 +721,8 @@ def eligible_data(data: AdsInput, alerts: list[Alert]) -> AdsInput | None:
     ids = {c.campaign_id for c in campaigns}
     return data.model_copy(update={"campaigns": campaigns, "max_total_daily_budget_micros": remaining_cap,
         "keywords": [k for k in data.keywords if k.campaign_id in ids],
-        "search_terms": [t for t in data.search_terms if t.campaign_id in ids]})
+        "search_terms": [t for t in data.search_terms if t.campaign_id in ids],
+        "recommendations": [r for r in data.recommendations if r.campaign_id in ids]})
 
 
 def strategic_exceptions(data: AdsInput, strategy: Strategy, orders: list[Order | NegativeOrder]) -> list[Alert]:
@@ -667,6 +878,8 @@ def capabilities() -> dict[str, Any]:
             "max_campaigns": 50, "max_keywords": 500, "max_search_terms": 300,
             "negative_match_types": ["EXACT"], "negative_scope": "AD_GROUP",
             "exception_monitoring": True, "auto_max_change_pct": AUTO_MAX_CHANGE_PCT,
+            "recommendation_screening": True, "asset_generation": True,
+            "whatsapp_configured": whatsapp_configuration()["configured"],
             "alert_provider": "resend", "notifications_configured": notification_configuration()["configured"]}
 
 
@@ -709,6 +922,25 @@ def monitor(data: AdsInput) -> MonitorResponse:
         alerts=alerts, notification_status=delivery.status, notification_receipts=delivery.receipts)
 
 
+@app.post("/assets/generate", response_model=AssetResponse, dependencies=[Depends(authenticate)])
+def generate_asset(data: AssetRequest) -> AssetResponse:
+    missing = missing_real_resources(data)
+    if missing:
+        try:
+            whatsapp_status, email_status = notify_resource_request(data, missing)
+        except Exception as exc:
+            log.error("Alerte ressource indisponible type=%s", type(exc).__name__)
+            whatsapp_status, email_status = "failed", "failed"
+        return AssetResponse(status="blocked", reason="Ressource réelle requise : " + ", ".join(missing),
+            whatsapp_status=whatsapp_status, email_status=email_status)
+    try:
+        model, image = generate_ad_image(data)
+    except Exception as exc:
+        log.error("Génération d'image échouée type=%s", type(exc).__name__)
+        raise HTTPException(status_code=503, detail="Génération d'image indisponible") from exc
+    return AssetResponse(status="generated", image_model=model, image_png_base64=image)
+
+
 @app.post("/optimize", response_model=AdsResponse, response_model_exclude_none=True, dependencies=[Depends(authenticate)])
 def optimize(data: AdsInput) -> AdsResponse:
     require_fresh_snapshot(data, timedelta(hours=24))
@@ -716,6 +948,7 @@ def optimize(data: AdsInput) -> AdsResponse:
     delivery = notify_exceptions(data, alerts)  # Les anomalies connues partent avant tout appel LLM.
     safe_data = eligible_data(data, alerts)
     orders: list[Order | NegativeOrder] = []
+    recommendation_orders: list[RecommendationOrder] = []
     try:
         if safe_data is not None:
             result = build_crew(safe_data).kickoff(inputs={"payload": safe_data.model_dump_json()})
@@ -743,6 +976,7 @@ def optimize(data: AdsInput) -> AdsResponse:
             if sum(budgets.values()) > data.max_total_daily_budget_micros:
                 orders = [o for o in orders if not isinstance(o, Order)
                           or o.new_daily_budget_micros < o.expected_current_budget_micros]
+        recommendation_orders = safe_recommendation_orders(data, alerts)
     except Exception as exc:
         error = Alert(code="OPTIMIZATION_FAILED", severity="critical", message="L'analyse automatique a échoué.",
                       suggested_action="Contrôler les journaux du serveur ; aucun ordre partiel émis.")
@@ -755,6 +989,7 @@ def optimize(data: AdsInput) -> AdsResponse:
         dry_run=os.environ.get("DRY_RUN", "true").lower() != "false",
         generated_at=generated, expires_at=generated + timedelta(minutes=30),
         summary="Exceptions détectées : consulter l'alerte." if alerts else "", orders=orders,
+        recommendation_orders=recommendation_orders,
         status="exception" if alerts else "nominal", silent=not alerts, requires_attention=bool(alerts),
         alerts=alerts, notification_status=delivery.status, notification_receipts=delivery.receipts,
     )

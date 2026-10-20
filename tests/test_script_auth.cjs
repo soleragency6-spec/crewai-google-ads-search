@@ -70,6 +70,35 @@ for (const filename of files) {
     assert.equal(requests[1].options.method, 'get');
     assert.equal(requests[1].options.headers.Authorization, 'Bearer ' + token);
   });
+  test(filename + ': seule une recommandation de conversion sans surcoût passe le contrôle Google Ads', () => {
+    const {context} = sandbox(filename);
+    const id = 'customers/1234567890/recommendations/999';
+    let applied = 0;
+    const stats = (cost, conversions) => ({getCost: () => cost, getConversions: () => conversions});
+    const recommendation = {getCampaign: () => ({getId: () => 111}),
+      getResourceName: () => id, getType: () => 'SITELINK_ASSET',
+      getBaseStats: () => stats(10, 10), getPotentialStats: () => stats(10, 11),
+      apply: () => {applied++;}};
+    const iterator = () => {let seen = false; return {
+      hasNext: () => !seen, next: () => {seen = true; return recommendation;}
+    };};
+    context.AdsApp.recommendations = () => ({withLimit: () => ({get: iterator}),
+      withResourceNames: names => ({get: () => {
+        assert.deepEqual(Array.from(names), [id]);
+        return iterator();
+      }})});
+    const candidates = context.collectRecommendations_([{campaign_id: '111'}], '1234567890');
+    assert.equal(candidates.length, 1);
+    assert.equal(candidates[0].base_cost_micros, 10000000);
+    const order = {order_id: 'a'.repeat(64), action: 'APPLY_GOOGLE_RECOMMENDATION',
+      resource_name: id, campaign_id: '111', recommendation_type: 'SITELINK_ASSET'};
+    const plan = context.prepareRecommendationPlan_([order], {recommendations: candidates}, {appliedOrders: {}});
+    assert.equal(plan.length, 1);
+    assert.equal(applied, 0); // La préparation et le mode Aperçu ne changent pas Google Ads.
+    recommendation.getType = () => 'CAMPAIGN_BUDGET';
+    assert.throws(() => context.prepareRecommendationPlan_([order],
+      {recommendations: candidates}, {appliedOrders: {}}), /modifiée/);
+  });
 }
 
 test('les deux scripts ne diffèrent que par leur mode de planification', () => {

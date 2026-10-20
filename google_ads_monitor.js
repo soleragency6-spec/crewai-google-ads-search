@@ -45,6 +45,8 @@ function main() {
     Logger.log('Aucune campagne Search avec budget quotidien individuel.');
     return;
   }
+  snapshot.recommendations = CONFIG.MODE === 'OPTIMIZE'
+    ? collectRecommendations_(snapshot.campaigns, customerId) : [];
   snapshot.request_id = CONFIG.MODE === 'MONITOR' ? Utilities.getUuid() : state.requestIds[periodKey] || Utilities.getUuid();
   snapshot.customer_id = customerId;
   snapshot.currency = account.getCurrencyCode();
@@ -94,9 +96,11 @@ function main() {
   const simulate = preview || CONFIG.DRY_RUN || result.dry_run;
   // Valider TOUT le plan avant la première modification.
   const plan = preparePlan_(result.orders, snapshot, state, timeZone);
+  const recommendationPlan = prepareRecommendationPlan_(result.recommendation_orders || [], snapshot, state);
   if (!result.silent || preview) Logger.log((simulate ? 'SIMULATION — ' : '') + result.summary);
   if (simulate) {
     plan.forEach(function(item) { Logger.log(JSON.stringify(item.order)); });
+    recommendationPlan.forEach(function(item) { Logger.log(JSON.stringify(item.order)); });
     Logger.log('Aucun changement Google Ads ni écriture de journal en simulation.');
     return;
   }
@@ -145,6 +149,16 @@ function main() {
     }
     state.appliedOrders[order.order_id] = Date.now();
     saveState_(store, state);
+  });
+  recommendationPlan.forEach(function(item) {
+    if (new Date(result.expires_at).getTime() <= Date.now()) throw new Error('Plan expiré avant recommandation.');
+    if (state.appliedOrders[item.order.order_id]) return;
+    // Une réponse ambiguë de Google ne doit pas réappliquer la recommandation au prochain passage.
+    state.appliedOrders[item.order.order_id] = Date.now();
+    saveState_(store, state);
+    item.recommendation.apply();
+    Logger.log('Recommandation appliquée : ' + item.order.recommendation_type
+      + ', campagne ' + item.order.campaign_id);
   });
   // Une campagne bloquée par exception pourra être réévaluée après correction.
   if (!result.requires_attention) state.completedPeriods[periodKey] = new Date().toISOString();
@@ -338,6 +352,67 @@ function collectData_(period, account, monitorOnly) {
       cost_micros: safeInteger_(row.metrics.costMicros), conversions: finiteNumber_(row.metrics.conversions)});
   }
   return {campaigns: campaigns, keywords: keywords, search_terms: terms};
+}
+
+function collectRecommendations_(campaigns, customerId) {
+  const ids = {};
+  campaigns.forEach(function(c) { ids[c.campaign_id] = true; });
+  const output = [];
+  const iterator = AdsApp.recommendations().withLimit(51).get();
+  while (iterator.hasNext()) {
+    const recommendation = iterator.next();
+    const campaign = recommendation.getCampaign();
+    if (!campaign || !ids[String(campaign.getId())]) continue;
+    const name = recommendation.getResourceName();
+    if (!new RegExp('^customers/' + customerId + '/recommendations/[0-9]+$').test(name)) continue;
+    const base = recommendation.getBaseStats();
+    const potential = recommendation.getPotentialStats();
+    output.push({resource_name: name, campaign_id: String(campaign.getId()),
+      type: recommendation.getType(),
+      base_cost_micros: base ? moneyToMicros_(base.getCost()) : null,
+      potential_cost_micros: potential ? moneyToMicros_(potential.getCost()) : null,
+      base_conversions: base ? finiteNumber_(base.getConversions()) : null,
+      potential_conversions: potential ? finiteNumber_(potential.getConversions()) : null});
+  }
+  if (output.length > 50) throw new Error('Plus de 50 recommandations ; réduire CAMPAIGN_IDS.');
+  return output;
+}
+
+function prepareRecommendationPlan_(orders, input, state) {
+  if (!Array.isArray(orders)) throw new Error('Liste de recommandations invalide.');
+  const candidates = {};
+  input.recommendations.forEach(function(r) { candidates[r.resource_name] = r; });
+  const seen = {}, plan = [];
+  orders.forEach(function(order) {
+    const source = candidates[order.resource_name];
+    if (order.action !== 'APPLY_GOOGLE_RECOMMENDATION'
+        || !/^[a-f0-9]{64}$/.test(order.order_id || '') || seen[order.order_id]
+        || !source || source.campaign_id !== order.campaign_id
+        || source.type !== order.recommendation_type
+        || !['SITELINK_ASSET', 'OPTIMIZE_AD_ROTATION'].includes(source.type)
+        || source.base_cost_micros <= 0 || source.potential_cost_micros > source.base_cost_micros
+        || source.base_conversions < 5
+        || source.potential_conversions < source.base_conversions * 1.05) {
+      throw new Error('Recommandation hors contrat : type, campagne ou gain estimé invalide.');
+    }
+    seen[order.order_id] = true;
+    if (state.appliedOrders[order.order_id]) return;
+    const iterator = AdsApp.recommendations().withResourceNames([order.resource_name]).get();
+    if (!iterator.hasNext()) return; // Google l'a déjà retirée ou appliquée.
+    const live = iterator.next();
+    const campaign = live.getCampaign();
+    const base = live.getBaseStats(), potential = live.getPotentialStats();
+    if (!campaign || String(campaign.getId()) !== order.campaign_id
+        || live.getType() !== source.type || !base || !potential
+        || moneyToMicros_(base.getCost()) <= 0
+        || moneyToMicros_(potential.getCost()) > moneyToMicros_(base.getCost())
+        || finiteNumber_(base.getConversions()) < 5
+        || finiteNumber_(potential.getConversions()) < finiteNumber_(base.getConversions()) * 1.05) {
+      throw new Error('Recommandation modifiée depuis son évaluation.');
+    }
+    plan.push({order: order, recommendation: live});
+  });
+  return plan;
 }
 
 function validateResponse_(result, input, mode) {
