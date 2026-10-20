@@ -8,3 +8,4 @@ __pycache__/
 .pytest_cache/
 .crewai/
 .DS_Store
+google_ads_script.configured.js
