@@ -1,12 +1,12 @@
 /**
  * Google Ads Scripts, compte individuel, moteur JavaScript V8.
- * Planifier une seule instance par compte, une fois par semaine.
+ * Planifier une seule instance par compte et par mode.
  * Version publique : renseigner le token dans votre copie privée uniquement.
  * Nécessite l'API /capabilities schema_version=1.1.
  */
 const CONFIG = {
   BASE_URL: 'https://mon-expert-google-ads.onrender.com',
-  WEBHOOK_TOKEN: 'COLLER_VOTRE_TOKEN_ICI',
+  WEBHOOK_TOKEN: 'COLLER_VOTRE_TOKEN_ICI', // Token brut ; le Script ajoute Bearer.
   MODE: 'OPTIMIZE', // OPTIMIZE : chaque semaine ; MONITOR : copie séparée chaque heure.
   ROAS_MONITORING_ENABLED: true, // false seulement si les valeurs de conversion ne sont pas applicables.
   DRY_RUN: false, // Le mode Aperçu et dry_run du serveur sont aussi respectés.
@@ -22,9 +22,7 @@ const CONFIG = {
 };
 
 function main() {
-  if (!CONFIG.WEBHOOK_TOKEN || CONFIG.WEBHOOK_TOKEN === 'COLLER_VOTRE_TOKEN_ICI') {
-    throw new Error('Renseigner WEBHOOK_TOKEN dans cette copie privée du Script.');
-  }
+  authorizationHeaders_(); // Valider la configuration sans journaliser le secret.
   if (!['OPTIMIZE', 'MONITOR'].includes(CONFIG.MODE)) throw new Error('MODE invalide.');
   requireCapabilities_();
   const account = AdsApp.currentAccount();
@@ -40,6 +38,8 @@ function main() {
   if (CONFIG.MODE === 'OPTIMIZE' && state.completedPeriods[periodKey]) {
     return;
   }
+  // Lecture seule : refuser un problème d'authentification avant l'analyse et les emails.
+  fetchJson_('/alerts/config', {method: 'get'});
   const snapshot = collectData_(period, account, CONFIG.MODE === 'MONITOR');
   if (!snapshot.campaigns.length) {
     Logger.log('Aucune campagne Search avec budget quotidien individuel.');
@@ -163,12 +163,38 @@ function requireCapabilities_() {
   }
 }
 
+function authorizationHeaders_(existingHeaders) {
+  if (typeof CONFIG.WEBHOOK_TOKEN !== 'string') {
+    throw new Error('Renseigner WEBHOOK_TOKEN dans cette copie privée du Script.');
+  }
+  // Tolérer un collage avec espaces externes ou avec un unique préfixe Bearer.
+  const token = CONFIG.WEBHOOK_TOKEN.trim().replace(/^Bearer[ \t]+/i, '').trim();
+  if (!token || token === 'COLLER_VOTRE_TOKEN_ICI' || /^Bearer$/i.test(token)
+      || /\s/.test(token)) {
+    throw new Error('WEBHOOK_TOKEN invalide : coller le token sur une seule ligne, sans espace interne.');
+  }
+  const headers = {};
+  Object.keys(existingHeaders || {}).forEach(function(name) {
+    if (name.toLowerCase() !== 'authorization') headers[name] = existingHeaders[name];
+  });
+  // main.py utilise HTTPBearer : aucun header X-Token ou WEBHOOK_TOKEN n'est attendu.
+  headers['Authorization'] = 'Bearer ' + token;
+  return headers;
+}
+
 function fetchJson_(path, options) {
-  options.headers = {Authorization: 'Bearer ' + CONFIG.WEBHOOK_TOKEN};
+  options = Object.assign({}, options || {});
+  options.headers = authorizationHeaders_(options.headers);
   options.muteHttpExceptions = true;
   options.followRedirects = false;
   const response = UrlFetchApp.fetch(CONFIG.BASE_URL.replace(/\/$/, '') + path, options);
   const code = response.getResponseCode();
+  if (code === 401) {
+    // Ne pas recopier une réponse qui pourrait contenir un secret réfléchi.
+    throw new Error('API HTTP 401 sur ' + path + ' : authentification refusée par le service ciblé. '
+      + 'En-tête envoyé : Authorization: Bearer <masqué>. '
+      + 'Le format attendu est appliqué ; contrôler la version du Script et le service indiqué par BASE_URL.');
+  }
   if (code !== 200) {
     // Ne pas afficher les en-têtes ni la requête contenant le secret.
     throw new Error('API HTTP ' + code + ' sur ' + path + ' : '

@@ -38,8 +38,12 @@ Si les valeurs de conversion ne sont pas pertinentes pour votre activité, défi
 
 Installer la nouvelle version du Script : l'ancienne n'envoie pas les valeurs de conversion ni la dépense du jour et ignore les campagnes sans CPA. Un simple redéploiement Python ne peut pas créer ces données.
 
-- Première copie : **`CONFIG.MODE='OPTIMIZE'`**, une fois par semaine. Les agents analysent la semaine complète arrivée à maturité et renvoient les optimisations de routine, sans rapport nominal.
-- Seconde copie : **`CONFIG.MODE='MONITOR'`**, chaque heure. Elle appelle `/monitor`, sans appel OpenAI et sans modification Google Ads, pour détecter les exceptions à chaque réception. Le ROAS porte sur 7 jours glissants arrivés à maturité ; la dépense budgétaire est celle du jour courant.
+- Première copie : [`google_ads_script.js`](google_ads_script.js), **`CONFIG.MODE='OPTIMIZE'`**, une fois par semaine. Les agents analysent la semaine complète arrivée à maturité et renvoient les optimisations de routine, sans rapport nominal.
+- Seconde copie : [`google_ads_monitor.js`](google_ads_monitor.js), **`CONFIG.MODE='MONITOR'`**, chaque heure. Elle appelle `/monitor`, sans appel OpenAI et sans modification Google Ads, pour détecter les exceptions à chaque réception. Le ROAS porte sur 7 jours glissants arrivés à maturité ; la dépense budgétaire est celle du jour courant.
+
+Les deux fichiers envoient exactement `Authorization: Bearer <WEBHOOK_TOKEN>`, conformément à `HTTPBearer` dans `main.py`. Ils conservent les autres en-têtes HTTP et remplacent toute autre variante de casse d'`Authorization`. Les espaces externes et un éventuel préfixe `Bearer` déjà collé dans la configuration sont normalisés. Avant d'envoyer les performances, un appel authentifié en lecture seule à `/alerts/config` vérifie la connexion, y compris en Aperçu. Un 401 arrête le traitement sans analyse OpenAI ni email. Le secret n'est jamais affiché dans le diagnostic d'authentification.
+
+La version précédente utilisait déjà le bon nom d'en-tête. Un 401 persistant après cette normalisation ne permet pas de conclure à une erreur de format : il faut vérifier le Script réellement installé et le déploiement ciblé. Pousser sur GitHub met à jour le dépôt et Render ; remplacer le contenu des deux Scripts dans l'éditeur Google Ads reste nécessaire.
 
 Le délai de conversion reste `CONVERSION_LAG_DAYS=7` par défaut pour les deux copies. Les alertes ROAS reflètent donc les périodes mûries, pas le ROAS intrajournalier non attribué. Le contrôle du budget du jour est effectué à chaque passage. « Immédiat » signifie dès réception des données : avec une planification horaire, le délai comprend jusqu'à une heure, la latence des statistiques Google et le réveil éventuel de Render Free. Sans appel du Script, le serveur ne surveille pas le compte.
 
@@ -52,6 +56,7 @@ Le mode Aperçu ne modifie pas Google Ads ni le journal Drive. Les appels HTTP e
 ```bash
 pip install -r requirements-dev.txt
 pytest tests/ -q
+node --test tests/test_script_auth.cjs
 ```
 
 Les tests du dépôt couvrent le silence nominal, les seuils ROAS, le budget du jour, le tCPA absent, les décisions majeures bloquées, les erreurs Resend et la déduplication après perte du journal Render. Les tests utilisent des transports simulés et n'envoient aucun email réel.
