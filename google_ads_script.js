@@ -7,6 +7,8 @@
 const CONFIG = {
   BASE_URL: 'https://mon-expert-google-ads.onrender.com',
   WEBHOOK_TOKEN: 'COLLER_VOTRE_TOKEN_ICI',
+  MODE: 'OPTIMIZE', // OPTIMIZE : chaque semaine ; MONITOR : copie séparée chaque heure.
+  ROAS_MONITORING_ENABLED: true, // false seulement si les valeurs de conversion ne sont pas applicables.
   DRY_RUN: false, // Le mode Aperçu et dry_run du serveur sont aussi respectés.
   CONVERSION_LAG_DAYS: 7,
   CONVERSION_TRACKING_CONFIRMED: true, // À confirmer pour vos conversions métier.
@@ -16,42 +18,51 @@ const CONFIG = {
   BUDGET_STABILITY_CONFIRMED: false, // true seulement si stable sur la période.
   MAX_TOTAL_DAILY_BUDGET: null, // null = somme actuelle des budgets sélectionnés.
   MAX_NEGATIVES_PER_RUN: 20,
-  MAX_CHANGE_PCT: 20
+  MAX_CHANGE_PCT: 10
 };
 
 function main() {
   if (!CONFIG.WEBHOOK_TOKEN || CONFIG.WEBHOOK_TOKEN === 'COLLER_VOTRE_TOKEN_ICI') {
     throw new Error('Renseigner WEBHOOK_TOKEN dans cette copie privée du Script.');
   }
-  if (!CONFIG.CONVERSION_TRACKING_CONFIRMED) {
-    throw new Error('Confirmer le suivi des conversions avant de lancer le Script.');
-  }
+  if (!['OPTIMIZE', 'MONITOR'].includes(CONFIG.MODE)) throw new Error('MODE invalide.');
   requireCapabilities_();
   const account = AdsApp.currentAccount();
   const customerId = account.getCustomerId().replace(/-/g, '');
   const timeZone = account.getTimeZone();
-  const period = weekPeriod_(new Date(), timeZone, CONFIG.CONVERSION_LAG_DAYS);
+  const period = CONFIG.MODE === 'MONITOR'
+    ? monitoringPeriod_(new Date(), timeZone, CONFIG.CONVERSION_LAG_DAYS)
+    : weekPeriod_(new Date(), timeZone, CONFIG.CONVERSION_LAG_DAYS);
   const periodKey = period.start + ':' + period.end;
   const preview = AdsApp.getExecutionInfo().isPreview();
   const store = readState_(customerId);
   const state = store.state;
-  if (state.completedPeriods[periodKey]) {
-    Logger.log('Période déjà appliquée : ' + periodKey);
+  if (CONFIG.MODE === 'OPTIMIZE' && state.completedPeriods[periodKey]) {
     return;
   }
-  const snapshot = collectData_(period, account);
+  const snapshot = collectData_(period, account, CONFIG.MODE === 'MONITOR');
   if (!snapshot.campaigns.length) {
-    Logger.log('Aucune campagne éligible avec un CPA cible connu.');
+    Logger.log('Aucune campagne Search avec budget quotidien individuel.');
     return;
   }
-  snapshot.request_id = state.requestIds[periodKey] || Utilities.getUuid();
+  snapshot.request_id = CONFIG.MODE === 'MONITOR' ? Utilities.getUuid() : state.requestIds[periodKey] || Utilities.getUuid();
   snapshot.customer_id = customerId;
   snapshot.currency = account.getCurrencyCode();
   snapshot.snapshot_at = new Date().toISOString();
   snapshot.period_start = period.start;
   snapshot.period_end = period.end;
   snapshot.conversion_lag_days = CONFIG.CONVERSION_LAG_DAYS;
-  snapshot.conversion_tracking_ok = true;
+  snapshot.conversion_tracking_ok = CONFIG.CONVERSION_TRACKING_CONFIRMED;
+  snapshot.account_timezone = timeZone;
+  snapshot.today_spend_date = Utilities.formatDate(new Date(), timeZone, 'yyyy-MM-dd');
+  const reference = previousPeriod_(period);
+  snapshot.reference_period_start = reference.start;
+  snapshot.reference_period_end = reference.end;
+  snapshot.roas_monitoring_enabled = CONFIG.ROAS_MONITORING_ENABLED;
+  snapshot.alert_receipts = {};
+  Object.keys(state.alertReceipts).forEach(function(key) {
+    if (state.alertReceipts[key] >= Date.now() / 1000 - 86400) snapshot.alert_receipts[key] = state.alertReceipts[key];
+  });
   snapshot.max_total_daily_budget_micros = CONFIG.MAX_TOTAL_DAILY_BUDGET === null
     ? snapshot.campaigns.reduce(function(sum, c) { return sum + c.daily_budget_micros; }, 0)
     : moneyToMicros_(CONFIG.MAX_TOTAL_DAILY_BUDGET);
@@ -59,17 +70,31 @@ function main() {
   if (body.length > 100000) {
     throw new Error('Lot trop volumineux. Réduire CAMPAIGN_IDS, sans dupliquer les campagnes entre Scripts.');
   }
-  Logger.log('Analyse ' + period.start + ' → ' + period.end + ', devise ' + snapshot.currency
+  if (preview) Logger.log('Analyse ' + period.start + ' → ' + period.end + ', devise ' + snapshot.currency
     + ', ' + snapshot.campaigns.length + ' campagnes, ' + snapshot.keywords.length
     + ' mots-clés, ' + snapshot.search_terms.length + ' termes de recherche.');
-  const result = fetchJson_('/optimize', {
+  const result = fetchJson_(CONFIG.MODE === 'MONITOR' ? '/monitor' : '/optimize', {
     method: 'post', contentType: 'application/json', payload: body
   });
-  validateResponse_(result, snapshot);
+  validateResponse_(result, snapshot, CONFIG.MODE);
+  const receipts = result.notification_receipts || {};
+  let receiptsChanged = false;
+  Object.keys(receipts).forEach(function(key) {
+    if (state.alertReceipts[key] !== receipts[key]) receiptsChanged = true;
+    state.alertReceipts[key] = receipts[key];
+  });
+  if (!preview && receiptsChanged) saveState_(store, state);
+  if (['failed', 'unconfigured'].includes(result.notification_status)) {
+    throw new Error('Alerte détectée mais email non transmis : vérifier RESEND_API_KEY et le domaine dans Render/Resend.');
+  }
+  if (CONFIG.MODE === 'MONITOR') {
+    if (!result.silent) Logger.log('Exception(s) détectée(s), canal email : ' + result.notification_status);
+    return;
+  }
   const simulate = preview || CONFIG.DRY_RUN || result.dry_run;
   // Valider TOUT le plan avant la première modification.
   const plan = preparePlan_(result.orders, snapshot, state, timeZone);
-  Logger.log((simulate ? 'SIMULATION — ' : '') + result.summary);
+  if (!result.silent || preview) Logger.log((simulate ? 'SIMULATION — ' : '') + result.summary);
   if (simulate) {
     plan.forEach(function(item) { Logger.log(JSON.stringify(item.order)); });
     Logger.log('Aucun changement Google Ads ni écriture de journal en simulation.');
@@ -120,7 +145,8 @@ function main() {
     state.appliedOrders[order.order_id] = Date.now();
     saveState_(store, state);
   });
-  state.completedPeriods[periodKey] = new Date().toISOString();
+  // Une campagne bloquée par exception pourra être réévaluée après correction.
+  if (!result.requires_attention) state.completedPeriods[periodKey] = new Date().toISOString();
   saveState_(store, state);
   Logger.log('Période terminée. Journal Drive : ' + store.file.getUrl());
 }
@@ -131,8 +157,8 @@ function requireCapabilities_() {
   catch (error) {
     throw new Error('Déployer la mise à jour API 1.1 (7 jours et négatifs) avant ce Script. ' + error.message);
   }
-  if (caps.schema_version !== '1.1' || caps.min_period_days > 7) {
-    throw new Error('Serveur incompatible : schema_version 1.1 requis.');
+  if (caps.schema_version !== '1.1' || caps.min_period_days > 7 || !caps.exception_monitoring) {
+    throw new Error('Serveur incompatible : version avec surveillance par exception requise.');
   }
 }
 
@@ -164,7 +190,25 @@ function weekPeriod_(now, timeZone, lag) {
   return {start: start.toISOString().slice(0, 10), end: end.toISOString().slice(0, 10)};
 }
 
-function collectData_(period, account) {
+function previousPeriod_(period) {
+  const end = new Date(period.start + 'T12:00:00Z');
+  end.setUTCDate(end.getUTCDate() - 1);
+  const length = Math.round((Date.parse(period.end) - Date.parse(period.start)) / 86400000) + 1;
+  const start = new Date(end);
+  start.setUTCDate(start.getUTCDate() - length + 1);
+  return {start: start.toISOString().slice(0, 10), end: end.toISOString().slice(0, 10)};
+}
+
+function monitoringPeriod_(now, timeZone, lag) {
+  if (!Number.isInteger(lag) || lag < 1 || lag > 90) throw new Error('Délai de conversion invalide.');
+  const end = new Date(Utilities.formatDate(now, timeZone, 'yyyy-MM-dd') + 'T12:00:00Z');
+  end.setUTCDate(end.getUTCDate() - lag);
+  const start = new Date(end);
+  start.setUTCDate(start.getUTCDate() - 6);
+  return {start: start.toISOString().slice(0, 10), end: end.toISOString().slice(0, 10)};
+}
+
+function collectData_(period, account, monitorOnly) {
   const campaigns = [];
   let selector = AdsApp.campaigns()
     .withCondition("campaign.status = 'ENABLED'")
@@ -181,19 +225,19 @@ function collectData_(period, account) {
       Logger.log('Campagne ignorée, budget partagé ou non quotidien : ' + id);
       continue;
     }
+    const nativeCpa = campaign.bidding().getTargetCpa();
     let cpa = CONFIG.TARGET_CPA_BY_CAMPAIGN_ID[id];
     if (cpa === undefined || cpa === null) cpa = CONFIG.DEFAULT_TARGET_CPA;
-    if (cpa === null || cpa === undefined) cpa = campaign.bidding().getTargetCpa();
-    if (!(Number(cpa) > 0)) {
-      Logger.log('Campagne ignorée, CPA métier à renseigner : ' + id + ' — ' + campaign.getName());
-      continue;
-    }
+    if (cpa === null || cpa === undefined) cpa = nativeCpa;
     campaigns.push({
-      campaign_id: id, channel_type: 'SEARCH', status: 'ENABLED',
+      campaign_id: id, name: campaign.getName(), channel_type: 'SEARCH', status: 'ENABLED',
       budget_id: String(budget.getId()), budget_type: 'DAILY', budget_shared: false,
       daily_budget_micros: moneyToMicros_(budget.getAmount()),
       budget_unchanged_during_period: CONFIG.BUDGET_STABILITY_CONFIRMED === true,
-      target_cpa_micros: moneyToMicros_(cpa), cost_micros: 0, conversions: 0,
+      target_cpa_micros: Number(cpa) > 0 ? moneyToMicros_(cpa) : null,
+      platform_target_cpa_micros: Number(nativeCpa) > 0 ? moneyToMicros_(nativeCpa) : null,
+      cost_micros: 0, conversions: 0, conversion_value_micros: 0,
+      previous_cost_micros: 0, previous_conversion_value_micros: 0, today_cost_micros: 0,
       search_budget_lost_impression_share: null
     });
   }
@@ -205,17 +249,36 @@ function collectData_(period, account) {
   const byId = {};
   campaigns.forEach(function(c) { byId[c.campaign_id] = c; });
   let rows = AdsApp.search(
-    'SELECT campaign.id, metrics.cost_micros, metrics.conversions, '
+    'SELECT campaign.id, metrics.cost_micros, metrics.conversions, metrics.conversions_value, '
     + 'metrics.search_budget_lost_impression_share FROM campaign WHERE ' + where);
   while (rows.hasNext()) {
     const row = rows.next();
     const c = byId[String(row.campaign.id)];
     c.cost_micros = safeInteger_(row.metrics.costMicros);
     c.conversions = finiteNumber_(row.metrics.conversions);
+    c.conversion_value_micros = row.metrics.conversionsValue === null || row.metrics.conversionsValue === undefined
+      ? null : valueToMicros_(row.metrics.conversionsValue);
     const share = row.metrics.searchBudgetLostImpressionShare;
     c.search_budget_lost_impression_share = share === null || share === undefined
       ? null : finiteNumber_(share);
   }
+  const reference = previousPeriod_(period);
+  rows = AdsApp.search('SELECT campaign.id, metrics.cost_micros, metrics.conversions_value FROM campaign WHERE '
+    + 'campaign.id IN (' + ids + ") AND segments.date BETWEEN '" + reference.start + "' AND '" + reference.end + "'");
+  while (rows.hasNext()) {
+    const row = rows.next();
+    const c = byId[String(row.campaign.id)];
+    c.previous_cost_micros = safeInteger_(row.metrics.costMicros);
+    c.previous_conversion_value_micros = row.metrics.conversionsValue === null || row.metrics.conversionsValue === undefined
+      ? null : valueToMicros_(row.metrics.conversionsValue);
+  }
+  rows = AdsApp.search('SELECT campaign.id, metrics.cost_micros FROM campaign WHERE '
+    + 'campaign.id IN (' + ids + ') AND segments.date DURING TODAY');
+  while (rows.hasNext()) {
+    const row = rows.next();
+    byId[String(row.campaign.id)].today_cost_micros = safeInteger_(row.metrics.costMicros);
+  }
+  if (monitorOnly) return {campaigns: campaigns, keywords: [], search_terms: []};
   const keywords = [];
   rows = AdsApp.search(
     'SELECT campaign.id, ad_group.id, ad_group_criterion.criterion_id, '
@@ -250,9 +313,13 @@ function collectData_(period, account) {
   return {campaigns: campaigns, keywords: keywords, search_terms: terms};
 }
 
-function validateResponse_(result, input) {
+function validateResponse_(result, input, mode) {
   if (result.schema_version !== '1.1' || result.request_id !== input.request_id
-      || result.customer_id !== input.customer_id || result.currency !== input.currency
+      || result.customer_id !== input.customer_id) {
+    throw new Error('Réponse incompatible avec la requête ou le compte.');
+  }
+  if (mode === 'MONITOR') return;
+  if (result.currency !== input.currency
       || typeof result.dry_run !== 'boolean' || !Array.isArray(result.orders)) {
     throw new Error('Réponse incompatible avec la requête ou le compte.');
   }
@@ -402,6 +469,12 @@ function safeInteger_(value) {
 
 function moneyToMicros_(amount) { return safeInteger_(Math.round(finiteNumber_(amount) * 1e6)); }
 
+function valueToMicros_(amount) {
+  const micros = Math.round(Number(amount) * 1e6);
+  if (!Number.isSafeInteger(micros)) throw new Error('Valeur de conversion invalide.');
+  return micros;
+}
+
 function readState_(customerId) {
   const name = 'CrewAI_Search_State_' + customerId + '.json';
   const files = DriveApp.getFilesByName(name);
@@ -412,6 +485,7 @@ function readState_(customerId) {
     : {customerId: customerId, completedPeriods: {}, requestIds: {}, appliedOrders: {}, budgetChanges: {}};
   if (state.customerId !== customerId || !state.completedPeriods || !state.requestIds
       || !state.appliedOrders || !state.budgetChanges) throw new Error('Journal Drive invalide.');
+  state.alertReceipts = state.alertReceipts || {};
   return {file: file, name: name, state: state};
 }
 
