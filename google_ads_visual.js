@@ -2,6 +2,7 @@
 const CONFIG = {
   BASE_URL: 'https://mon-expert-google-ads.onrender.com',
   WEBHOOK_TOKEN: 'COLLER_VOTRE_TOKEN_ICI', // Token brut, sans le mot Bearer.
+  ALERT_EMAIL: 'soleragency6@gmail.com',
   DRY_RUN: false,
   BRAND_NAME: '', // Nom de marque réel validé par le client.
   PRODUCT_OR_SERVICE: '', // Offre réelle, sans promesse inventée.
@@ -32,14 +33,17 @@ function main() {
       brand_name: CONFIG.BRAND_NAME || 'Marque à préciser',
       product_or_service: CONFIG.PRODUCT_OR_SERVICE || 'Offre de la campagne à préciser',
       audience: CONFIG.AUDIENCE || 'Public cible à préciser',
-      required_resources: Array.from(new Set(missing))
+      required_resources: Array.from(new Set(missing)), mailapp_delivery: true
     };
     const result = fetchApi_('/assets/generate', {
       method: 'post', contentType: 'application/json', payload: JSON.stringify(request)
     }, token);
     if (result.status === 'blocked') {
-      Logger.log('Asset bloqué, campagne ' + item.campaignId + ' : ' + result.reason
-        + '. WhatsApp=' + result.whatsapp_status + ', email=' + result.email_status);
+      if (!preview) MailApp.sendEmail(CONFIG.ALERT_EMAIL,
+        '[Google Ads] Ressource visuelle requise — campagne ' + item.campaignId,
+        'Compte ' + accountId + ', campagne ' + item.campaignId + '\n' + result.reason
+          + '\nFournir la ressource officielle avant toute création de visuel.');
+      Logger.log('Asset bloqué, campagne ' + item.campaignId + ' : ' + result.reason);
       return;
     }
     if (result.status !== 'generated' || !result.image_png_base64 ||

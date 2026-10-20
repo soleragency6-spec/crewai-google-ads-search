@@ -7,6 +7,7 @@
 const CONFIG = {
   BASE_URL: 'https://mon-expert-google-ads.onrender.com',
   WEBHOOK_TOKEN: 'COLLER_VOTRE_TOKEN_ICI', // Token brut ; le Script ajoute Bearer.
+  ALERT_EMAIL: 'soleragency6@gmail.com',
   MODE: 'OPTIMIZE', // OPTIMIZE : chaque semaine ; MONITOR : copie séparée chaque heure.
   ROAS_MONITORING_ENABLED: true, // false seulement si les valeurs de conversion ne sont pas applicables.
   DRY_RUN: false, // Le mode Aperçu et dry_run du serveur sont aussi respectés.
@@ -18,6 +19,7 @@ const CONFIG = {
   BUDGET_STABILITY_CONFIRMED: false, // true seulement si stable sur la période.
   MAX_TOTAL_DAILY_BUDGET: null, // null = somme actuelle des budgets sélectionnés.
   MAX_NEGATIVES_PER_RUN: 20,
+  ZERO_IMPRESSIONS_BASELINE: 100, // Impressions cumulées des 7 jours précédant hier.
   MAX_CHANGE_PCT: 10
 };
 
@@ -35,11 +37,21 @@ function main() {
   const preview = AdsApp.getExecutionInfo().isPreview();
   const store = readState_(customerId);
   const state = store.state;
+  // L'authentification du serveur est vérifiée avant l'analyse distante.
+  fetchJson_('/alerts/config', {method: 'get'});
+  let localAlerts;
+  try { localAlerts = collectGoogleCriticalAlerts_(timeZone); }
+  catch (error) {
+    sendCriticalMail_([{code: 'LOCAL_MONITORING_FAILED', severity: 'critical',
+      message: 'Contrôle local Google Ads impossible : ' + String(error.message || error).slice(0, 300),
+      suggested_action: 'Vérifier les autorisations et les journaux du Script.'}],
+      store, state, customerId, preview);
+    throw error;
+  }
+  sendCriticalMail_(localAlerts, store, state, customerId, preview);
   if (CONFIG.MODE === 'OPTIMIZE' && state.completedPeriods[periodKey]) {
     return;
   }
-  // Lecture seule : refuser un problème d'authentification avant l'analyse et les emails.
-  fetchJson_('/alerts/config', {method: 'get'});
   const snapshot = collectData_(period, account, CONFIG.MODE === 'MONITOR');
   if (!snapshot.campaigns.length) {
     Logger.log('Aucune campagne Search avec budget quotidien individuel.');
@@ -61,6 +73,7 @@ function main() {
   snapshot.reference_period_start = reference.start;
   snapshot.reference_period_end = reference.end;
   snapshot.roas_monitoring_enabled = CONFIG.ROAS_MONITORING_ENABLED;
+  snapshot.mailapp_delivery = true;
   snapshot.alert_receipts = {};
   Object.keys(state.alertReceipts).forEach(function(key) {
     if (state.alertReceipts[key] >= Date.now() / 1000 - 86400) snapshot.alert_receipts[key] = state.alertReceipts[key];
@@ -75,10 +88,20 @@ function main() {
   if (preview) Logger.log('Analyse ' + period.start + ' → ' + period.end + ', devise ' + snapshot.currency
     + ', ' + snapshot.campaigns.length + ' campagnes, ' + snapshot.keywords.length
     + ' mots-clés, ' + snapshot.search_terms.length + ' termes de recherche.');
-  const result = fetchJson_(CONFIG.MODE === 'MONITOR' ? '/monitor' : '/optimize', {
-    method: 'post', contentType: 'application/json', payload: body
-  });
+  let result;
+  try {
+    result = fetchJson_(CONFIG.MODE === 'MONITOR' ? '/monitor' : '/optimize', {
+      method: 'post', contentType: 'application/json', payload: body
+    });
+  } catch (error) {
+    sendCriticalMail_([{code: 'API_ANALYSIS_FAILED', severity: 'critical',
+      message: 'Analyse serveur indisponible : ' + String(error.message || error).slice(0, 300),
+      suggested_action: 'Contrôler Render et relancer le Script après correction.'}],
+      store, state, customerId, preview);
+    throw error;
+  }
   validateResponse_(result, snapshot, CONFIG.MODE);
+  sendCriticalMail_(result.alerts || [], store, state, customerId, preview);
   const receipts = result.notification_receipts || {};
   let receiptsChanged = false;
   Object.keys(receipts).forEach(function(key) {
@@ -86,11 +109,8 @@ function main() {
     state.alertReceipts[key] = receipts[key];
   });
   if (!preview && receiptsChanged) saveState_(store, state);
-  if (['failed', 'unconfigured'].includes(result.notification_status)) {
-    throw new Error('Alerte détectée mais email non transmis : vérifier RESEND_API_KEY et le domaine dans Render/Resend.');
-  }
   if (CONFIG.MODE === 'MONITOR') {
-    if (!result.silent) Logger.log('Exception(s) détectée(s), canal email : ' + result.notification_status);
+    if (!result.silent) Logger.log('Exception(s) détectée(s), canal Gmail MailApp.');
     return;
   }
   const simulate = preview || CONFIG.DRY_RUN || result.dry_run;
@@ -216,6 +236,126 @@ function fetchJson_(path, options) {
   }
   try { return JSON.parse(response.getContentText()); }
   catch (error) { throw new Error('La réponse API n’est pas un JSON valide.'); }
+}
+
+function sendCriticalMail_(alerts, store, state, customerId, preview) {
+  if (!Array.isArray(alerts)) throw new Error('Liste d’alertes invalide.');
+  state.gmailAlertReceipts = state.gmailAlertReceipts || {};
+  const now = Date.now();
+  const pending = [];
+  alerts.forEach(function(alert) {
+    if (!alert || typeof alert.code !== 'string') return;
+    const key = String(alert.campaign_id || 'account') + ':' + alert.code;
+    if (state.gmailAlertReceipts[key] && now - state.gmailAlertReceipts[key] < 86400000) return;
+    pending.push({key: key, alert: alert});
+  });
+  if (!pending.length) return;
+  if (preview) {
+    Logger.log('Aperçu : ' + pending.length + ' alerte(s) Gmail à envoyer, aucun email expédié.');
+    return;
+  }
+  const lines = ['Compte Google Ads : ' + customerId, 'Détection : ' + new Date(now).toISOString(),
+    'Contrôler les problèmes ci-dessous dans Google Ads.', ''];
+  pending.forEach(function(item) {
+    const a = item.alert;
+    lines.push('[' + String(a.severity || 'warning').toUpperCase() + '] ' + item.key);
+    lines.push(String(a.message || '').slice(0, 500));
+    lines.push('Action : ' + String(a.suggested_action || 'Vérifier dans Google Ads.').slice(0, 500));
+    lines.push('');
+  });
+  MailApp.sendEmail(CONFIG.ALERT_EMAIL,
+    '[Google Ads] ' + pending.length + ' alerte(s) — compte ' + customerId,
+    lines.join('\n').slice(0, 15000));
+  pending.forEach(function(item) { state.gmailAlertReceipts[item.key] = now; });
+  saveState_(store, state);
+  Logger.log(pending.length + ' alerte(s) transmises par MailApp.');
+}
+
+function collectGoogleCriticalAlerts_(timeZone) {
+  const alerts = [];
+  let rows = AdsApp.search('SELECT customer.id, customer.status FROM customer LIMIT 1');
+  if (!rows.hasNext()) throw new Error('Statut du compte introuvable.');
+  const account = rows.next().customer;
+  if (account.status === 'SUSPENDED') {
+    alerts.push({code: 'ACCOUNT_SUSPENDED', severity: 'critical',
+      message: 'Le compte Google Ads est suspendu. La cause peut être la facturation ou une règle Google ; le Script ne peut pas la déterminer.',
+      suggested_action: 'Ouvrir Google Ads > Notifications et Facturation, puis consulter le motif exact.'});
+  }
+  try {
+    rows = AdsApp.search('SELECT billing_setup.status FROM billing_setup LIMIT 50');
+    const statuses = [];
+    while (rows.hasNext()) statuses.push(rows.next().billingSetup.status);
+    if (statuses.includes('CANCELLED') && !statuses.includes('APPROVED')
+        && !statuses.includes('APPROVED_HELD')) {
+      alerts.push({code: 'BILLING_SETUP_CANCELLED', severity: 'critical',
+        message: 'Aucun paramétrage de facturation approuvé trouvé ; un paramétrage est annulé. Ce signal ne prouve pas un paiement refusé.',
+        suggested_action: 'Vérifier immédiatement Facturation > Paramètres et les notifications Google Ads.'});
+    }
+  } catch (error) {
+    alerts.push({code: 'BILLING_CHECK_UNAVAILABLE', severity: 'critical',
+      message: 'Le paramétrage de facturation n’a pas pu être consulté par le Script. Aucun défaut de paiement n’est confirmé.',
+      suggested_action: 'Vérifier la page Facturation et les notifications du compte Google Ads.'});
+  }
+  let query = "SELECT campaign.id, campaign.name, campaign.status, campaign.primary_status, "
+    + "campaign.primary_status_reasons FROM campaign WHERE campaign.advertising_channel_type = 'SEARCH' "
+    + "AND campaign.status IN ('ENABLED', 'PAUSED')";
+  if (CONFIG.CAMPAIGN_IDS.length) query += ' AND campaign.id IN ('
+    + CONFIG.CAMPAIGN_IDS.map(safeIdNumber_).join(',') + ')';
+  rows = AdsApp.search(query + ' LIMIT 501');
+  const enabled = {}, names = {};
+  let count = 0;
+  while (rows.hasNext()) {
+    if (++count > 500) throw new Error('Plus de 500 campagnes Search à surveiller ; renseigner CAMPAIGN_IDS.');
+    const c = rows.next().campaign;
+    const id = String(c.id), name = String(c.name || id);
+    names[id] = name;
+    if (c.status === 'PAUSED') {
+      alerts.push({code: 'CAMPAIGN_PAUSED', campaign_id: id, severity: 'critical',
+        message: 'Campagne Search en pause : ' + name,
+        suggested_action: 'Vérifier si la mise en pause est volontaire.'});
+      continue;
+    }
+    enabled[id] = true;
+    const reasons = Array.isArray(c.primaryStatusReasons) ? c.primaryStatusReasons : [];
+    if (reasons.includes('HAS_ADS_DISAPPROVED')
+        || ['NOT_ELIGIBLE', 'PAUSED'].includes(c.primaryStatus)) {
+      alerts.push({code: 'CAMPAIGN_NOT_SERVING', campaign_id: id, severity: 'critical',
+        message: 'Campagne Search refusée ou non éligible : ' + name + '. Statut : '
+          + String(c.primaryStatus || 'inconnu') + ' ; motifs : ' + reasons.join(', '),
+        suggested_action: 'Vérifier la colonne État et les détails des annonces dans Google Ads.'});
+    }
+  }
+  const ids = Object.keys(enabled);
+  if (!ids.length) return alerts;
+  const yesterday = new Date(Utilities.formatDate(new Date(), timeZone, 'yyyy-MM-dd') + 'T12:00:00Z');
+  yesterday.setUTCDate(yesterday.getUTCDate() - 1);
+  const baselineStart = new Date(yesterday);
+  baselineStart.setUTCDate(baselineStart.getUTCDate() - 7);
+  const baselineEnd = new Date(yesterday);
+  baselineEnd.setUTCDate(baselineEnd.getUTCDate() - 1);
+  const date = function(d) { return d.toISOString().slice(0, 10); };
+  const impressions = function(start, end) {
+    const totals = {};
+    const q = 'SELECT campaign.id, metrics.impressions FROM campaign WHERE campaign.id IN ('
+      + ids.join(',') + ") AND segments.date BETWEEN '" + start + "' AND '" + end + "'";
+    const report = AdsApp.search(q);
+    while (report.hasNext()) {
+      const row = report.next(), id = String(row.campaign.id);
+      totals[id] = safeInteger_(row.metrics.impressions);
+    }
+    return totals;
+  };
+  const baseline = impressions(date(baselineStart), date(baselineEnd));
+  const current = impressions(date(yesterday), date(yesterday));
+  ids.forEach(function(id) {
+    if ((baseline[id] || 0) >= CONFIG.ZERO_IMPRESSIONS_BASELINE && (current[id] || 0) === 0) {
+      alerts.push({code: 'IMPRESSIONS_ZERO', campaign_id: id, severity: 'critical',
+        message: 'Campagne active sans impression hier : ' + names[id] + '. Elle avait '
+          + baseline[id] + ' impressions sur les sept jours précédents.',
+        suggested_action: 'Vérifier diffusion, enchères, budget, refus et facturation.'});
+    }
+  });
+  return alerts;
 }
 
 function weekPeriod_(now, timeZone, lag) {

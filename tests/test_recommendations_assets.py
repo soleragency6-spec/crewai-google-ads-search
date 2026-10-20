@@ -81,6 +81,14 @@ def test_google_tag_issue_requires_technical_attention():
     assert not m.safe_recommendation_orders(data, [])
 
 
+def test_script_mailapp_delivery_skips_server_email(monkeypatch):
+    data = payload().model_copy(update={"mailapp_delivery": True})
+    monkeypatch.setattr(m, "send_alert_email", lambda *args: pytest.fail("Resend ne doit pas être appelé"))
+    alert = m.Alert(code="ROAS_DROP", severity="critical", message="Baisse ROAS", suggested_action="Vérifier")
+    result = m.notify_exceptions(data, [alert])
+    assert result.status == "not_needed"
+
+
 def asset_request(**changes):
     body = dict(request_id=str(uuid4()), customer_id="1234567890", campaign_id="111",
         campaign_type="PERFORMANCE_MAX", brand_name="Marque exemple",
@@ -103,6 +111,18 @@ def test_real_resource_blocks_generation_and_uses_email_when_whatsapp_unconfigur
     assert second.json()["email_status"] == "suppressed"
     assert len(captured) == 1
     assert "OFFICIAL_LOGO" in captured[0][1]
+
+
+def test_visual_script_mailapp_delivery_blocks_without_server_notification(monkeypatch):
+    monkeypatch.setattr(m, "notify_resource_request", lambda *args: pytest.fail("Alerte serveur interdite"))
+    monkeypatch.setattr(m, "generate_ad_image", lambda *args: pytest.fail("Image interdite"))
+    body = asset_request(required_resources=["OFFICIAL_LOGO"], mailapp_delivery=True)
+    with TestClient(m.app) as client:
+        result = client.post("/assets/generate", json=body,
+            headers={"Authorization": "Bearer test-only-" + "x" * 32})
+    assert result.status_code == 200
+    assert result.json()["status"] == "blocked"
+    assert result.json()["email_status"] == "not_needed"
 
 
 def test_phrase_detection_blocks_real_person_and_exact_brand_chart():

@@ -127,6 +127,7 @@ class AdsInput(Model):
     keywords: list[Keyword] = Field(max_length=500)
     search_terms: list[SearchTerm] = Field(default_factory=list, max_length=300)
     recommendations: list[GoogleRecommendation] = Field(default_factory=list, max_length=50)
+    mailapp_delivery: bool = False  # Le Google Ads Script envoie les alertes avec MailApp.
 
     @model_validator(mode="after")
     def validate_snapshot(self) -> AdsInput:
@@ -295,6 +296,7 @@ class AssetRequest(Model):
     product_or_service: str = Field(min_length=5, max_length=500)
     audience: str = Field(min_length=3, max_length=300)
     required_resources: list[RealResource] = Field(default_factory=list, max_length=3)
+    mailapp_delivery: bool = False
 
 
 class AssetResponse(Model):
@@ -657,6 +659,8 @@ def notify_exceptions(data: AdsInput, alerts: list[Alert]) -> DeliveryResult:
     """Une alerte par compte/campagne/type sur 24 h ; échecs retentés à la prochaine observation."""
     if not alerts:
         return DeliveryResult(status="not_needed")
+    if data.mailapp_delivery:
+        return DeliveryResult(status="not_needed")
     now = time.time()
     pending = []
     receipts = {key: stamp for key, stamp in data.alert_receipts.items() if now - 86400 <= stamp <= now + 300}
@@ -926,6 +930,9 @@ def monitor(data: AdsInput) -> MonitorResponse:
 def generate_asset(data: AssetRequest) -> AssetResponse:
     missing = missing_real_resources(data)
     if missing:
+        if data.mailapp_delivery:
+            return AssetResponse(status="blocked", reason="Ressource réelle requise : " + ", ".join(missing),
+                whatsapp_status="unconfigured", email_status="not_needed")
         try:
             whatsapp_status, email_status = notify_resource_request(data, missing)
         except Exception as exc:
